@@ -5,8 +5,9 @@ import time
 import logging
 import threading
 import queue
+import tempfile
 from question_generator import generate_question
-from stream_creator import generate_question_frames, WIDTH, HEIGHT, FPS
+from stream_creator import generate_question_frames, generate_audio_loop_file, WIDTH, HEIGHT, FPS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,6 +17,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 STREAM_KEY = os.environ.get("YOUTUBE_STREAM_KEY")
+
+# Timing constants (must match the values passed to generate_question_frames)
+QUESTION_SECS   = 12
+COUNTDOWN_SECS  = 5
+ANSWER_SECS     = 5
+TRANSITION_SECS = 2
 
 def find_ffmpeg():
     """Find ffmpeg binary in common locations."""
@@ -65,8 +72,8 @@ def find_ffmpeg():
     log.info(f"Using imageio ffmpeg: {path}")
     return path
 
-def get_ffmpeg_process(ffmpeg_path, audio_read_fd):
-    """Start FFmpeg process that streams to YouTube Live with real audio."""
+def get_ffmpeg_process(ffmpeg_path, audio_loop_path):
+    """Start FFmpeg process that streams to YouTube Live with looping audio."""
     rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
     cmd = [
@@ -79,11 +86,13 @@ def get_ffmpeg_process(ffmpeg_path, audio_read_fd):
         "-s", f"{WIDTH}x{HEIGHT}",
         "-r", str(FPS),
         "-i", "pipe:0",
-        # Audio from a second pipe (raw s16le stereo PCM)
+        # Looping audio file (raw s16le stereo PCM)
+        "-re",
+        "-stream_loop", "-1",
         "-f", "s16le",
         "-ar", "44100",
         "-ac", "2",
-        "-i", f"pipe:{audio_read_fd}",
+        "-i", audio_loop_path,
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-vcodec", "libx264",
@@ -105,8 +114,7 @@ def get_ffmpeg_process(ffmpeg_path, audio_read_fd):
         cmd,
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        bufsize=10**7,
-        pass_fds=(audio_read_fd,)
+        bufsize=10**7
     )
 
 def preload_next_question(q_queue):
@@ -133,16 +141,6 @@ def log_ffmpeg_stderr(ffmpeg_proc):
         except Exception as e:
             log.error(f"Failed to read FFmpeg stderr: {e}")
 
-def _close_pipe(pipe_obj, name="pipe"):
-    """Safely close a pipe / fd-wrapper."""
-    if pipe_obj is None:
-        return
-    try:
-        pipe_obj.close()
-    except Exception as e:
-        log.debug(f"Ignoring {name} close error: {e}")
-
-
 def stream_forever():
     if not STREAM_KEY:
         log.error("❌ YOUTUBE_STREAM_KEY environment variable is not set!")
@@ -156,6 +154,17 @@ def stream_forever():
     ffmpeg_path = find_ffmpeg()
     log.info(f"✅ Using ffmpeg: {ffmpeg_path}")
 
+    # Generate the audio loop file once at startup
+    audio_loop_path = os.path.join(tempfile.gettempdir(), "gk_audio_loop.pcm")
+    generate_audio_loop_file(
+        audio_loop_path,
+        question_secs=QUESTION_SECS,
+        countdown_secs=COUNTDOWN_SECS,
+        answer_secs=ANSWER_SECS,
+        transition_secs=TRANSITION_SECS,
+    )
+    log.info(f"🔊 Audio loop generated: {audio_loop_path}")
+
     q_queue = queue.Queue(maxsize=5)
     preloader = threading.Thread(target=preload_next_question, args=(q_queue,), daemon=True)
     preloader.start()
@@ -165,11 +174,10 @@ def stream_forever():
         time.sleep(1)
 
     ffmpeg = None
-    audio_write_pipe = None      # os.fdopen wrapper for the audio write fd
     question_num = 1
+    frame_duration = 1.0 / FPS
 
     while True:
-        # ── (Re)start FFmpeg with fresh audio pipe ──
         if ffmpeg is None or ffmpeg.poll() is not None:
             if ffmpeg is not None:
                 log.error(f"❌ FFmpeg process exited with code {ffmpeg.poll()}.")
@@ -177,19 +185,7 @@ def stream_forever():
                 log.info("Sleeping 5 seconds before restarting FFmpeg to avoid log rate-limiting...")
                 time.sleep(5)
 
-            # Clean up previous audio pipe
-            _close_pipe(audio_write_pipe, "audio_write_pipe")
-            audio_write_pipe = None
-
-            # Create a fresh pipe pair for audio
-            audio_read_fd, audio_write_fd = os.pipe()
-            ffmpeg = get_ffmpeg_process(ffmpeg_path, audio_read_fd)
-
-            # Parent no longer needs the read-end (FFmpeg inherited it)
-            os.close(audio_read_fd)
-            # Wrap the write-end for convenient .write()
-            audio_write_pipe = os.fdopen(audio_write_fd, 'wb', buffering=0)
-            log.info("🔊 Audio pipe established.")
+            ffmpeg = get_ffmpeg_process(ffmpeg_path, audio_loop_path)
 
         log.info(f"📺 Streaming question #{question_num}...")
         try:
@@ -204,20 +200,19 @@ def stream_forever():
         pipe_broken = False
         frame_gen = generate_question_frames(
             qdata,
-            question_secs=12,
-            countdown_secs=5,
-            answer_secs=5,
-            transition_secs=2
+            question_secs=QUESTION_SECS,
+            countdown_secs=COUNTDOWN_SECS,
+            answer_secs=ANSWER_SECS,
+            transition_secs=TRANSITION_SECS,
         )
 
-        for video_bytes, audio_bytes in frame_gen:
+        for frame_bytes in frame_gen:
             if ffmpeg.poll() is not None:
                 log.warning("FFmpeg process died mid-stream.")
                 pipe_broken = True
                 break
             try:
-                ffmpeg.stdin.write(video_bytes)
-                audio_write_pipe.write(audio_bytes)
+                ffmpeg.stdin.write(frame_bytes)
             except (BrokenPipeError, IOError):
                 log.warning("FFmpeg pipe broken during frame write.")
                 pipe_broken = True
@@ -225,9 +220,11 @@ def stream_forever():
 
         if pipe_broken:
             log_ffmpeg_stderr(ffmpeg)
-            _close_pipe(ffmpeg.stdin, "ffmpeg.stdin")
-            _close_pipe(audio_write_pipe, "audio_write_pipe")
-            audio_write_pipe = None
+            try:
+                if ffmpeg.stdin:
+                    ffmpeg.stdin.close()
+            except Exception:
+                pass
             ffmpeg = None
             log.info("Sleeping 5 seconds before retrying stream loop...")
             time.sleep(5)

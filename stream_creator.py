@@ -528,9 +528,53 @@ def _audio_for_frame(frame_in_sec, sound, fps=FPS, rate=AUDIO_RATE):
     return _mono_to_stereo_pcm(chunk)
 
 
-def _samples_for_frame(frame_idx, fps=FPS, rate=AUDIO_RATE):
-    """Number of audio samples that correspond to a single video frame."""
-    return int((frame_idx + 1) * rate / fps) - int(frame_idx * rate / fps)
+def generate_audio_loop_file(filepath,
+                              question_secs=12,
+                              countdown_secs=5,
+                              answer_secs=5,
+                              transition_secs=2):
+    """
+    Generate a raw PCM audio file (s16le stereo 44100 Hz) for one complete
+    question cycle.  Use with ``ffmpeg -stream_loop -1`` to loop it forever
+    in perfect sync with the video frames.
+
+    Returns *filepath* for convenience.
+    """
+    total_secs = question_secs + countdown_secs + answer_secs + transition_secs
+    total_samples = total_secs * AUDIO_RATE
+
+    # Start with silence
+    audio = np.zeros(total_samples, dtype=np.int16)
+
+    # Pre-generate the short sound effects
+    tick      = _make_beep(freq=880,  duration=0.10, volume=0.45)
+    tick_warn = _make_beep(freq=1000, duration=0.12, volume=0.50)
+    tick_last = _make_beep(freq=1200, duration=0.18, volume=0.60)
+    ding      = _make_ding()
+
+    # Place countdown ticks (one per second during countdown phase)
+    for i in range(countdown_secs):
+        t_sec = question_secs + i          # absolute second in the cycle
+        remaining = countdown_secs - i     # seconds left on timer
+        if remaining == 1:
+            beep = tick_last
+        elif remaining <= 2:
+            beep = tick_warn
+        else:
+            beep = tick
+        offset = t_sec * AUDIO_RATE
+        end = min(offset + len(beep), total_samples)
+        audio[offset:end] = beep[:end - offset]
+
+    # Place answer-reveal ding
+    ding_offset = (question_secs + countdown_secs) * AUDIO_RATE
+    end = min(ding_offset + len(ding), total_samples)
+    audio[ding_offset:end] = ding[:end - ding_offset]
+
+    # Convert mono → stereo and write to disk
+    stereo = np.column_stack((audio, audio)).astype(np.int16)
+    stereo.tofile(filepath)
+    return filepath
 
 
 # ── Frame Generator ────────────────────────────────────────────────────────────
@@ -541,47 +585,28 @@ def generate_question_frames(qdata,
                               answer_secs=5,
                               transition_secs=2):
     """
-    Generator yielding (video_bytes, audio_bytes) tuples for one complete
-    question cycle.  Audio is raw s16le stereo PCM at 44100 Hz.
+    Generator yielding raw video byte-frames for one complete question cycle.
+    Audio is handled separately via the looping PCM file.
     Ultra-low memory footprint — one frame at a time.
     """
-    # Pre-generate the short sound effects (tiny arrays)
-    tick      = _make_beep(freq=880,  duration=0.10, volume=0.45)
-    tick_warn = _make_beep(freq=1000, duration=0.12, volume=0.50)
-    tick_last = _make_beep(freq=1200, duration=0.18, volume=0.60)
-    ding      = _make_ding()
-
-    # ── 1. Question phase — video + silence ──
+    # 1. Question phase
     qf_bytes = make_question_frame(qdata).tobytes()
-    for f in range(question_secs * FPS):
-        n = _samples_for_frame(f)
-        yield (qf_bytes, _silence_pcm(n))
+    for _ in range(question_secs * FPS):
+        yield qf_bytes
 
-    # ── 2. Countdown phase — tick at the start of every second ──
+    # 2. Countdown phase
     for s in range(countdown_secs, 0, -1):
         cf_bytes = make_countdown_frame(qdata, s, total=countdown_secs).tobytes()
-        # Choose beep urgency
-        if s == 1:
-            beep = tick_last
-        elif s <= 2:
-            beep = tick_warn
-        else:
-            beep = tick
-        for f in range(FPS):
-            yield (cf_bytes, _audio_for_frame(f, beep))
+        for _ in range(FPS):
+            yield cf_bytes
 
-    # ── 3. Answer phase — ding at the reveal, then silence ──
+    # 3. Answer phase
     af_bytes = make_answer_frame(qdata).tobytes()
-    for f in range(answer_secs * FPS):
-        if f < FPS:          # ding plays during the first second
-            yield (af_bytes, _audio_for_frame(f, ding))
-        else:
-            n = _samples_for_frame(f)
-            yield (af_bytes, _silence_pcm(n))
+    for _ in range(answer_secs * FPS):
+        yield af_bytes
 
-    # ── 4. Transition animation — silence ──
+    # 4. Transition animation
     transition_frames = transition_secs * FPS
     for i in range(transition_frames):
         t = i / transition_frames
-        n = _samples_for_frame(i)
-        yield (make_transition_frame(t).tobytes(), _silence_pcm(n))
+        yield make_transition_frame(t).tobytes()

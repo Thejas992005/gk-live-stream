@@ -23,15 +23,73 @@ ANGLES = [
 ]
 
 FREE_MODELS = [
-    "meta-llama/llama-3.1-8b-instruct",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
     "mistralai/mistral-7b-instruct:free",
     "google/gemma-2-9b-it:free",
-    "qwen/qwen-2-7b-instruct:free",
+    "qwen/qwen-2.5-7b-instruct:free",
 ]
 
 # Track seen questions in memory to prevent repetitions
 SEEN_QUESTIONS = set()
 MAX_SEEN_HISTORY = 300
+
+def sanitize_and_validate(result, fallback_topic):
+    if not isinstance(result, dict):
+        raise ValueError("Response is not a valid JSON object")
+    
+    question = str(result.get("question", "")).strip()
+    if not question:
+        raise ValueError("Missing or empty question")
+
+    options_raw = result.get("options")
+    options_dict = {}
+
+    if isinstance(options_raw, dict):
+        for k, v in options_raw.items():
+            clean_k = str(k).strip().upper()
+            if "A" in clean_k: clean_k = "A"
+            elif "B" in clean_k: clean_k = "B"
+            elif "C" in clean_k: clean_k = "C"
+            elif "D" in clean_k: clean_k = "D"
+            options_dict[clean_k] = str(v).strip()
+    elif isinstance(options_raw, list) and len(options_raw) >= 4:
+        for idx, item in enumerate(options_raw[:4]):
+            options_dict[["A", "B", "C", "D"][idx]] = str(item).strip()
+    else:
+        raise ValueError("Invalid or missing options format")
+
+    for key in ["A", "B", "C", "D"]:
+        if key not in options_dict or not options_dict[key]:
+            raise ValueError(f"Missing option content for option {key}")
+
+    answer_raw = str(result.get("answer", "")).strip().upper()
+    answer_letter = ""
+    for char in answer_raw:
+        if char in ["A", "B", "C", "D"]:
+            answer_letter = char
+            break
+    if not answer_letter:
+        raise ValueError(f"Could not parse valid answer letter from '{answer_raw}'")
+
+    explanation = str(result.get("explanation", "")).strip()
+    if not explanation:
+        explanation = f"The correct answer is {answer_letter}: {options_dict[answer_letter]}."
+
+    topic = str(result.get("topic", fallback_topic)).strip()
+
+    return {
+        "question": question,
+        "options": {
+            "A": options_dict["A"],
+            "B": options_dict["B"],
+            "C": options_dict["C"],
+            "D": options_dict["D"],
+        },
+        "answer": answer_letter,
+        "explanation": explanation,
+        "topic": topic
+    }
 
 def generate_question(retries=5):
     global SEEN_QUESTIONS
@@ -77,8 +135,8 @@ Return ONLY a JSON object in this exact format, with no extra text or markdown c
                         },
                         timeout=15
                     )
-                    if response.status_code == 404:
-                        print(f"Model {model} not available, trying next...")
+                    if response.status_code in (404, 401, 402):
+                        print(f"Model {model} returned status {response.status_code}, trying next model...")
                         break
                     if response.status_code != 200:
                         raise Exception(f"API error {response.status_code}: {response.text}")
@@ -92,10 +150,13 @@ Return ONLY a JSON object in this exact format, with no extra text or markdown c
                     end = text.rfind("}") + 1
                     if start != -1 and end > start:
                         text = text[start:end]
-                    result = json.loads(text)
+                    raw_result = json.loads(text)
                     
-                    q_text = result.get("question", "").strip().lower()
-                    if not q_text or q_text in SEEN_QUESTIONS:
+                    # Sanitize and validate
+                    clean_result = sanitize_and_validate(raw_result, topic)
+                    
+                    q_text = clean_result["question"].strip().lower()
+                    if q_text in SEEN_QUESTIONS:
                         print(f"⚠️ Duplicate question detected ({q_text[:30]}...). Retrying...")
                         continue
                     
@@ -105,7 +166,7 @@ Return ONLY a JSON object in this exact format, with no extra text or markdown c
                         SEEN_QUESTIONS = set(list(SEEN_QUESTIONS)[-150:])
 
                     print(f"✅ Unique Question generated using {model}")
-                    return result
+                    return clean_result
                 except Exception as e:
                     print(f"Attempt {attempt+1} with {model} failed: {e}")
                     time.sleep(3)

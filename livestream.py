@@ -65,30 +65,56 @@ def find_ffmpeg():
     log.info(f"Using imageio ffmpeg: {path}")
     return path
 
+def find_background_music():
+    """Find a background music file in workspace if present."""
+    candidates = ["bg_music.mp3", "eliveta-background-music-491190.mp3", "music.mp3", "bg_music.wav", "music.wav", "audio.mp3"]
+    for c in candidates:
+        if os.path.exists(c):
+            log.info(f"🎵 Found background music file: {c}")
+            return c
+    return None
+
 def get_ffmpeg_process(ffmpeg_path):
     """Start FFmpeg process that streams to YouTube Live."""
     rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
+    bg_music = find_background_music()
 
     cmd = [
         ffmpeg_path,
         "-y",
-        "-re",
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24",
         "-s", f"{WIDTH}x{HEIGHT}",
         "-r", str(FPS),
         "-i", "pipe:0",
-        "-re",
-        "-f", "lavfi",
-        "-i", "anullsrc=r=44100:cl=stereo",
-        "-map", "0:v:0",
-        "-map", "1:a:0",
+    ]
+
+    if bg_music:
+        log.info(f"🎶 Streaming with background music loop ({bg_music})...")
+        cmd.extend([
+            "-stream_loop", "-1",
+            "-i", bg_music,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-af", "volume=0.35",
+        ])
+    else:
+        log.info("ℹ️ No custom background music MP3 found. Streaming silent track (add bg_music.mp3 to loop music)...")
+        cmd.extend([
+            "-re",
+            "-f", "lavfi",
+            "-i", "anullsrc=r=44100:cl=stereo",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+        ])
+
+    cmd.extend([
         "-vcodec", "libx264",
         "-preset", "veryfast",
-        "-b:v", "2500k",
-        "-maxrate", "3000k",
-        "-bufsize", "6000k",
+        "-b:v", "4000k",
+        "-maxrate", "5000k",
+        "-bufsize", "8000k",
         "-pix_fmt", "yuv420p",
         "-g", str(FPS * 2),
         "-acodec", "aac",
@@ -96,7 +122,7 @@ def get_ffmpeg_process(ffmpeg_path):
         "-b:a", "128k",
         "-f", "flv",
         rtmp_url
-    ]
+    ])
 
     log.info("🎥 Starting FFmpeg stream to YouTube...")
     return subprocess.Popen(
@@ -184,17 +210,21 @@ def stream_forever():
             transition_secs=2
         )
 
-        for frame_bytes in frame_gen:
-            if ffmpeg.poll() is not None:
-                log.warning("FFmpeg process died mid-stream.")
-                pipe_broken = True
-                break
-            try:
-                ffmpeg.stdin.write(frame_bytes)
-            except (BrokenPipeError, IOError):
-                log.warning("FFmpeg pipe broken during frame write.")
-                pipe_broken = True
-                break
+        try:
+            for frame_bytes in frame_gen:
+                if ffmpeg.poll() is not None:
+                    log.warning("FFmpeg process died mid-stream.")
+                    pipe_broken = True
+                    break
+                try:
+                    ffmpeg.stdin.write(frame_bytes)
+                except (BrokenPipeError, IOError):
+                    log.warning("FFmpeg pipe broken during frame write.")
+                    pipe_broken = True
+                    break
+        except Exception as gen_err:
+            log.error(f"Error during frame generation/writing: {gen_err}")
+            pipe_broken = True
 
         if pipe_broken:
             log_ffmpeg_stderr(ffmpeg)

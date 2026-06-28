@@ -18,21 +18,61 @@ log = logging.getLogger(__name__)
 
 STREAM_KEY = os.environ.get("YOUTUBE_STREAM_KEY")
 
-def get_ffmpeg_process():
+def find_ffmpeg():
+    """Find ffmpeg binary in common locations."""
+    locations = [
+        "ffmpeg",
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/nix/var/nix/profiles/default/bin/ffmpeg",
+    ]
+    # Also search nix store
+    try:
+        result = subprocess.run(["which", "ffmpeg"],
+                               capture_output=True, text=True)
+        if result.returncode == 0:
+            path = result.stdout.strip()
+            log.info(f"Found ffmpeg at: {path}")
+            return path
+    except:
+        pass
+
+    # Search nix store
+    try:
+        result = subprocess.run(
+            ["find", "/nix/store", "-name", "ffmpeg", "-type", "f"],
+            capture_output=True, text=True, timeout=10
+        )
+        paths = [p for p in result.stdout.strip().split('\n') if p and 'bin/ffmpeg' in p]
+        if paths:
+            log.info(f"Found ffmpeg in nix store: {paths[0]}")
+            return paths[0]
+    except:
+        pass
+
+    # Install ffmpeg via pip as fallback
+    log.info("Installing ffmpeg-python...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "imageio-ffmpeg"], check=True)
+    import imageio_ffmpeg
+    path = imageio_ffmpeg.get_ffmpeg_exe()
+    log.info(f"Using imageio ffmpeg: {path}")
+    return path
+
+def get_ffmpeg_process(ffmpeg_path):
     """Start FFmpeg process that streams to YouTube Live."""
     rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
     cmd = [
-        "ffmpeg",
+        ffmpeg_path,
         "-y",
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24",
         "-s", f"{WIDTH}x{HEIGHT}",
         "-r", str(FPS),
-        "-i", "pipe:0",           # Read frames from stdin
+        "-i", "pipe:0",
         "-f", "lavfi",
-        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",  # Silent audio
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-vcodec", "libx264",
         "-preset", "veryfast",
         "-maxrate", "2500k",
@@ -79,6 +119,10 @@ def stream_forever():
     log.info("🔴 GK LIVE QUIZ STREAM STARTING!")
     log.info("=" * 55)
 
+    # Find ffmpeg
+    ffmpeg_path = find_ffmpeg()
+    log.info(f"✅ Using ffmpeg: {ffmpeg_path}")
+
     # Queue to hold preloaded questions
     q_queue = queue.Queue(maxsize=3)
 
@@ -87,35 +131,33 @@ def stream_forever():
                                  args=(q_queue,), daemon=True)
     preloader.start()
 
-    # Wait for first question to be ready
+    # Wait for first question
     log.info("⏳ Loading first question...")
     while q_queue.empty():
         time.sleep(1)
 
-    ffmpeg = get_ffmpeg_process()
+    ffmpeg = get_ffmpeg_process(ffmpeg_path)
     question_num = 1
 
     try:
         while True:
-            # Get next question (wait if not ready)
             log.info(f"📺 Streaming question #{question_num}...")
             qdata, frames = q_queue.get(timeout=30)
-            log.info(f"❓ Question: {qdata['question'][:60]}...")
+            log.info(f"❓ {qdata['question'][:60]}...")
 
-            # Stream all frames
             for frame in frames:
                 try:
                     ffmpeg.stdin.write(frame.tobytes())
                 except BrokenPipeError:
                     log.warning("FFmpeg pipe broken — restarting...")
-                    ffmpeg = get_ffmpeg_process()
+                    ffmpeg = get_ffmpeg_process(ffmpeg_path)
                     ffmpeg.stdin.write(frame.tobytes())
 
             question_num += 1
             log.info(f"✅ Question #{question_num-1} streamed!")
 
     except KeyboardInterrupt:
-        log.info("🛑 Stream stopped by user.")
+        log.info("🛑 Stream stopped.")
     except Exception as e:
         log.error(f"Stream error: {e}")
     finally:

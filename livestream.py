@@ -5,9 +5,8 @@ import time
 import logging
 import threading
 import queue
-import tempfile
 from question_generator import generate_question
-from stream_creator import generate_question_frames, generate_audio_loop_file, WIDTH, HEIGHT, FPS
+from stream_creator import generate_question_frames, WIDTH, HEIGHT, FPS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,12 +16,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 STREAM_KEY = os.environ.get("YOUTUBE_STREAM_KEY")
-
-# Timing constants (must match the values passed to generate_question_frames)
-QUESTION_SECS   = 12
-COUNTDOWN_SECS  = 5
-ANSWER_SECS     = 5
-TRANSITION_SECS = 2
 
 def find_ffmpeg():
     """Find ffmpeg binary in common locations."""
@@ -72,8 +65,8 @@ def find_ffmpeg():
     log.info(f"Using imageio ffmpeg: {path}")
     return path
 
-def get_ffmpeg_process(ffmpeg_path, audio_loop_path):
-    """Start FFmpeg process that streams to YouTube Live with looping audio."""
+def get_ffmpeg_process(ffmpeg_path):
+    """Start FFmpeg process that streams to YouTube Live."""
     rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
     cmd = [
@@ -86,13 +79,9 @@ def get_ffmpeg_process(ffmpeg_path, audio_loop_path):
         "-s", f"{WIDTH}x{HEIGHT}",
         "-r", str(FPS),
         "-i", "pipe:0",
-        # Looping audio file (raw s16le stereo PCM)
         "-re",
-        "-stream_loop", "-1",
-        "-f", "s16le",
-        "-ar", "44100",
-        "-ac", "2",
-        "-i", audio_loop_path,
+        "-f", "lavfi",
+        "-i", "anullsrc=r=44100:cl=stereo",
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-vcodec", "libx264",
@@ -109,7 +98,7 @@ def get_ffmpeg_process(ffmpeg_path, audio_loop_path):
         rtmp_url
     ]
 
-    log.info("🎥 Starting FFmpeg stream to YouTube (with audio)...")
+    log.info("🎥 Starting FFmpeg stream to YouTube...")
     return subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -154,17 +143,6 @@ def stream_forever():
     ffmpeg_path = find_ffmpeg()
     log.info(f"✅ Using ffmpeg: {ffmpeg_path}")
 
-    # Generate the audio loop file once at startup
-    audio_loop_path = os.path.join(tempfile.gettempdir(), "gk_audio_loop.pcm")
-    generate_audio_loop_file(
-        audio_loop_path,
-        question_secs=QUESTION_SECS,
-        countdown_secs=COUNTDOWN_SECS,
-        answer_secs=ANSWER_SECS,
-        transition_secs=TRANSITION_SECS,
-    )
-    log.info(f"🔊 Audio loop generated: {audio_loop_path}")
-
     q_queue = queue.Queue(maxsize=5)
     preloader = threading.Thread(target=preload_next_question, args=(q_queue,), daemon=True)
     preloader.start()
@@ -185,7 +163,7 @@ def stream_forever():
                 log.info("Sleeping 5 seconds before restarting FFmpeg to avoid log rate-limiting...")
                 time.sleep(5)
 
-            ffmpeg = get_ffmpeg_process(ffmpeg_path, audio_loop_path)
+            ffmpeg = get_ffmpeg_process(ffmpeg_path)
 
         log.info(f"📺 Streaming question #{question_num}...")
         try:
@@ -200,10 +178,10 @@ def stream_forever():
         pipe_broken = False
         frame_gen = generate_question_frames(
             qdata,
-            question_secs=QUESTION_SECS,
-            countdown_secs=COUNTDOWN_SECS,
-            answer_secs=ANSWER_SECS,
-            transition_secs=TRANSITION_SECS,
+            question_secs=12,
+            countdown_secs=5,
+            answer_secs=5,
+            transition_secs=2
         )
 
         for frame_bytes in frame_gen:

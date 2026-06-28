@@ -39,12 +39,6 @@ OPT_BG_COLORS = {
 }
 
 
-# ── Audio Constants ────────────────────────────────────────────────────────────
-AUDIO_RATE = 44100
-AUDIO_CHANNELS = 2
-BYTES_PER_SAMPLE = 4   # 2 bytes/channel × 2 channels (s16le stereo)
-
-
 # ── Font Helpers ───────────────────────────────────────────────────────────────
 
 def get_font(size):
@@ -468,115 +462,6 @@ def make_transition_frame(t, total=1.0):
     return np.array(img)
 
 
-# ── Audio Synthesis ────────────────────────────────────────────────────────────
-
-def _make_beep(freq=880, duration=0.1, volume=0.4):
-    """Generate a short beep as a mono int16 numpy array."""
-    n = int(AUDIO_RATE * duration)
-    t = np.arange(n, dtype=np.float64) / AUDIO_RATE
-    # Envelope: 5ms attack, sqrt decay
-    attack = np.minimum(1.0, np.arange(n, dtype=np.float64) / (AUDIO_RATE * 0.005))
-    decay = np.maximum(0.0, 1.0 - (np.arange(n, dtype=np.float64) / n) ** 0.5)
-    env = attack * decay
-    wave = (32767 * volume * env * np.sin(2 * np.pi * freq * t)).astype(np.int16)
-    return wave
-
-
-def _make_ding(freq1=523, freq2=784, duration=0.35, volume=0.35):
-    """Generate a pleasant two-tone ding (C5 + G5 chord)."""
-    n = int(AUDIO_RATE * duration)
-    t = np.arange(n, dtype=np.float64) / AUDIO_RATE
-    attack = np.minimum(1.0, np.arange(n, dtype=np.float64) / (AUDIO_RATE * 0.003))
-    decay = np.maximum(0.0, 1.0 - (np.arange(n, dtype=np.float64) / n) ** 0.7)
-    env = attack * decay
-    wave = (32767 * volume * env * (
-        0.6 * np.sin(2 * np.pi * freq1 * t) +
-        0.4 * np.sin(2 * np.pi * freq2 * t)
-    )).astype(np.int16)
-    return wave
-
-
-def _mono_to_stereo_pcm(mono):
-    """Convert mono int16 numpy array → stereo s16le PCM bytes."""
-    stereo = np.column_stack((mono, mono)).astype(np.int16)
-    return stereo.tobytes()
-
-
-def _silence_pcm(n_samples):
-    """Generate n_samples of stereo silence as raw PCM bytes."""
-    return b'\x00' * (n_samples * BYTES_PER_SAMPLE)
-
-
-def _audio_for_frame(frame_in_sec, sound, fps=FPS, rate=AUDIO_RATE):
-    """
-    Return stereo PCM bytes for one video frame within a 1-second window.
-    `sound` plays from sample 0; the rest is silence.
-    `frame_in_sec` is the frame index (0 … fps-1) inside that second.
-    """
-    s_start = int(frame_in_sec * rate / fps)
-    s_end   = int((frame_in_sec + 1) * rate / fps)
-    n = s_end - s_start
-
-    if sound is not None and s_start < len(sound):
-        end_idx = min(s_end, len(sound))
-        chunk = sound[s_start:end_idx]
-        if len(chunk) < n:
-            chunk = np.concatenate([chunk, np.zeros(n - len(chunk), dtype=np.int16)])
-    else:
-        return _silence_pcm(n)
-
-    return _mono_to_stereo_pcm(chunk)
-
-
-def generate_audio_loop_file(filepath,
-                              question_secs=12,
-                              countdown_secs=5,
-                              answer_secs=5,
-                              transition_secs=2):
-    """
-    Generate a raw PCM audio file (s16le stereo 44100 Hz) for one complete
-    question cycle.  Use with ``ffmpeg -stream_loop -1`` to loop it forever
-    in perfect sync with the video frames.
-
-    Returns *filepath* for convenience.
-    """
-    total_secs = question_secs + countdown_secs + answer_secs + transition_secs
-    total_samples = total_secs * AUDIO_RATE
-
-    # Start with silence
-    audio = np.zeros(total_samples, dtype=np.int16)
-
-    # Pre-generate the short sound effects
-    tick      = _make_beep(freq=880,  duration=0.10, volume=0.45)
-    tick_warn = _make_beep(freq=1000, duration=0.12, volume=0.50)
-    tick_last = _make_beep(freq=1200, duration=0.18, volume=0.60)
-    ding      = _make_ding()
-
-    # Place countdown ticks (one per second during countdown phase)
-    for i in range(countdown_secs):
-        t_sec = question_secs + i          # absolute second in the cycle
-        remaining = countdown_secs - i     # seconds left on timer
-        if remaining == 1:
-            beep = tick_last
-        elif remaining <= 2:
-            beep = tick_warn
-        else:
-            beep = tick
-        offset = t_sec * AUDIO_RATE
-        end = min(offset + len(beep), total_samples)
-        audio[offset:end] = beep[:end - offset]
-
-    # Place answer-reveal ding
-    ding_offset = (question_secs + countdown_secs) * AUDIO_RATE
-    end = min(ding_offset + len(ding), total_samples)
-    audio[ding_offset:end] = ding[:end - ding_offset]
-
-    # Convert mono → stereo and write to disk
-    stereo = np.column_stack((audio, audio)).astype(np.int16)
-    stereo.tofile(filepath)
-    return filepath
-
-
 # ── Frame Generator ────────────────────────────────────────────────────────────
 
 def generate_question_frames(qdata,
@@ -585,9 +470,8 @@ def generate_question_frames(qdata,
                               answer_secs=5,
                               transition_secs=2):
     """
-    Generator yielding raw video byte-frames for one complete question cycle.
-    Audio is handled separately via the looping PCM file.
-    Ultra-low memory footprint — one frame at a time.
+    Generator yielding raw byte frames for one complete question cycle.
+    Ultra low memory footprint to prevent container crashes.
     """
     # 1. Question phase
     qf_bytes = make_question_frame(qdata).tobytes()

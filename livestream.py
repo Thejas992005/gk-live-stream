@@ -1,5 +1,4 @@
 import subprocess
-import numpy as np
 import os
 import sys
 import time
@@ -73,6 +72,7 @@ def get_ffmpeg_process(ffmpeg_path):
     cmd = [
         ffmpeg_path,
         "-y",
+        "-re",  # Read input at native frame rate (real-time stream)
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24",
@@ -100,7 +100,6 @@ def get_ffmpeg_process(ffmpeg_path):
     ]
 
     log.info("🎥 Starting FFmpeg stream to YouTube...")
-    # Capture stderr so we can inspect error logs if FFmpeg crashes
     return subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -109,20 +108,13 @@ def get_ffmpeg_process(ffmpeg_path):
     )
 
 def preload_next_question(q_queue):
-    """Background thread to preload next question."""
+    """Background thread to preload question metadata (ultra low memory)."""
     while True:
         try:
-            if q_queue.qsize() < 2:
+            if q_queue.qsize() < 3:
                 log.info("⏳ Pre-loading next question...")
                 qdata = generate_question()
-                frames = generate_question_frames(
-                    qdata,
-                    question_secs=12,
-                    countdown_secs=5,
-                    answer_secs=5,
-                    transition_secs=2
-                )
-                q_queue.put((qdata, frames))
+                q_queue.put(qdata)
                 log.info(f"✅ Pre-loaded: {qdata['question'][:50]}...")
             time.sleep(1)
         except Exception as e:
@@ -152,7 +144,7 @@ def stream_forever():
     ffmpeg_path = find_ffmpeg()
     log.info(f"✅ Using ffmpeg: {ffmpeg_path}")
 
-    q_queue = queue.Queue(maxsize=3)
+    q_queue = queue.Queue(maxsize=5)
     preloader = threading.Thread(target=preload_next_question, args=(q_queue,), daemon=True)
     preloader.start()
 
@@ -162,6 +154,7 @@ def stream_forever():
 
     ffmpeg = None
     question_num = 1
+    frame_duration = 1.0 / FPS
 
     while True:
         if ffmpeg is None or ffmpeg.poll() is not None:
@@ -175,7 +168,7 @@ def stream_forever():
 
         log.info(f"📺 Streaming question #{question_num}...")
         try:
-            qdata, frames = q_queue.get(timeout=30)
+            qdata = q_queue.get(timeout=30)
         except queue.Empty:
             log.warning("Queue empty, waiting for questions...")
             time.sleep(2)
@@ -184,17 +177,32 @@ def stream_forever():
         log.info(f"❓ {qdata['question'][:60]}...")
 
         pipe_broken = False
-        for frame in frames:
+        frame_gen = generate_question_frames(
+            qdata,
+            question_secs=12,
+            countdown_secs=5,
+            answer_secs=5,
+            transition_secs=2
+        )
+
+        for frame_bytes in frame_gen:
+            t0 = time.time()
             if ffmpeg.poll() is not None:
                 log.warning("FFmpeg process died mid-stream.")
                 pipe_broken = True
                 break
             try:
-                ffmpeg.stdin.write(frame.tobytes())
+                ffmpeg.stdin.write(frame_bytes)
             except (BrokenPipeError, IOError):
                 log.warning("FFmpeg pipe broken during frame write.")
                 pipe_broken = True
                 break
+
+            # Frame rate pacing to ensure smooth real-time streaming
+            elapsed = time.time() - t0
+            sleep_time = frame_duration - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
         if pipe_broken:
             log_ffmpeg_stderr(ffmpeg)

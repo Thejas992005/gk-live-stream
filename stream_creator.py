@@ -236,29 +236,27 @@ def generate_question_frames(qdata,
                               answer_secs=5,
                               transition_secs=2):
     """
-    Returns list of numpy frames for one complete question cycle.
-    Total = question_secs + countdown_secs + answer_secs + transition_secs
-    Default: 5+5+3+2 = 15s ≈ 13s of content + 2s transition
+    Generator yielding raw byte frames for one complete question cycle.
+    Ultra low memory footprint to prevent container crashes.
     """
-    frames = []
-
     # 1. Question phase
-    qf = make_question_frame(qdata)
-    frames += [qf] * (question_secs * FPS)
+    qf_bytes = make_question_frame(qdata).tobytes()
+    for _ in range(question_secs * FPS):
+        yield qf_bytes
 
     # 2. Countdown phase
     for s in range(countdown_secs, 0, -1):
-        cf = make_countdown_frame(qdata, s, total=countdown_secs)
-        frames += [cf] * FPS
+        cf_bytes = make_countdown_frame(qdata, s, total=countdown_secs).tobytes()
+        for _ in range(FPS):
+            yield cf_bytes
 
     # 3. Answer phase
-    af = make_answer_frame(qdata)
-    frames += [af] * (answer_secs * FPS)
+    af_bytes = make_answer_frame(qdata).tobytes()
+    for _ in range(answer_secs * FPS):
+        yield af_bytes
 
     # 4. Transition animation
     transition_frames = transition_secs * FPS
     for i in range(transition_frames):
         t = i / transition_frames
-        frames.append(make_transition_frame(t))
-
-    return frames
+        yield make_transition_frame(t).tobytes()

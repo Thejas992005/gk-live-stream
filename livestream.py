@@ -72,12 +72,14 @@ def get_ffmpeg_process(ffmpeg_path):
     cmd = [
         ffmpeg_path,
         "-y",
+        "-re",
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24",
         "-s", f"{WIDTH}x{HEIGHT}",
         "-r", str(FPS),
         "-i", "pipe:0",
+        "-re",
         "-f", "lavfi",
         "-i", "anullsrc=r=44100:cl=stereo",
         "-map", "0:v:0",
@@ -85,10 +87,8 @@ def get_ffmpeg_process(ffmpeg_path):
         "-vcodec", "libx264",
         "-preset", "veryfast",
         "-b:v", "2500k",
-        "-minrate", "2500k",
-        "-maxrate", "2500k",
-        "-bufsize", "5000k",
-        "-nal-hrd", "cbr",
+        "-maxrate", "3000k",
+        "-bufsize", "6000k",
         "-pix_fmt", "yuv420p",
         "-g", str(FPS * 2),
         "-acodec", "aac",
@@ -184,8 +184,6 @@ def stream_forever():
             transition_secs=2
         )
 
-        start_time = time.time()
-        frame_idx = 0
         for frame_bytes in frame_gen:
             if ffmpeg.poll() is not None:
                 log.warning("FFmpeg process died mid-stream.")
@@ -193,17 +191,10 @@ def stream_forever():
                 break
             try:
                 ffmpeg.stdin.write(frame_bytes)
-                ffmpeg.stdin.flush()
             except (BrokenPipeError, IOError):
                 log.warning("FFmpeg pipe broken during frame write.")
                 pipe_broken = True
                 break
-
-            frame_idx += 1
-            target_time = start_time + (frame_idx * frame_duration)
-            sleep_time = target_time - time.time()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
 
         if pipe_broken:
             log_ffmpeg_stderr(ffmpeg)

@@ -65,8 +65,8 @@ def find_ffmpeg():
     log.info(f"Using imageio ffmpeg: {path}")
     return path
 
-def get_ffmpeg_process(ffmpeg_path):
-    """Start FFmpeg process that streams to YouTube Live."""
+def get_ffmpeg_process(ffmpeg_path, audio_read_fd):
+    """Start FFmpeg process that streams to YouTube Live with real audio."""
     rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{STREAM_KEY}"
 
     cmd = [
@@ -79,9 +79,11 @@ def get_ffmpeg_process(ffmpeg_path):
         "-s", f"{WIDTH}x{HEIGHT}",
         "-r", str(FPS),
         "-i", "pipe:0",
-        "-re",
-        "-f", "lavfi",
-        "-i", "anullsrc=r=44100:cl=stereo",
+        # Audio from a second pipe (raw s16le stereo PCM)
+        "-f", "s16le",
+        "-ar", "44100",
+        "-ac", "2",
+        "-i", f"pipe:{audio_read_fd}",
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-vcodec", "libx264",
@@ -98,12 +100,13 @@ def get_ffmpeg_process(ffmpeg_path):
         rtmp_url
     ]
 
-    log.info("🎥 Starting FFmpeg stream to YouTube...")
+    log.info("🎥 Starting FFmpeg stream to YouTube (with audio)...")
     return subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        bufsize=10**7
+        bufsize=10**7,
+        pass_fds=(audio_read_fd,)
     )
 
 def preload_next_question(q_queue):
@@ -130,6 +133,16 @@ def log_ffmpeg_stderr(ffmpeg_proc):
         except Exception as e:
             log.error(f"Failed to read FFmpeg stderr: {e}")
 
+def _close_pipe(pipe_obj, name="pipe"):
+    """Safely close a pipe / fd-wrapper."""
+    if pipe_obj is None:
+        return
+    try:
+        pipe_obj.close()
+    except Exception as e:
+        log.debug(f"Ignoring {name} close error: {e}")
+
+
 def stream_forever():
     if not STREAM_KEY:
         log.error("❌ YOUTUBE_STREAM_KEY environment variable is not set!")
@@ -152,10 +165,11 @@ def stream_forever():
         time.sleep(1)
 
     ffmpeg = None
+    audio_write_pipe = None      # os.fdopen wrapper for the audio write fd
     question_num = 1
-    frame_duration = 1.0 / FPS
 
     while True:
+        # ── (Re)start FFmpeg with fresh audio pipe ──
         if ffmpeg is None or ffmpeg.poll() is not None:
             if ffmpeg is not None:
                 log.error(f"❌ FFmpeg process exited with code {ffmpeg.poll()}.")
@@ -163,7 +177,19 @@ def stream_forever():
                 log.info("Sleeping 5 seconds before restarting FFmpeg to avoid log rate-limiting...")
                 time.sleep(5)
 
-            ffmpeg = get_ffmpeg_process(ffmpeg_path)
+            # Clean up previous audio pipe
+            _close_pipe(audio_write_pipe, "audio_write_pipe")
+            audio_write_pipe = None
+
+            # Create a fresh pipe pair for audio
+            audio_read_fd, audio_write_fd = os.pipe()
+            ffmpeg = get_ffmpeg_process(ffmpeg_path, audio_read_fd)
+
+            # Parent no longer needs the read-end (FFmpeg inherited it)
+            os.close(audio_read_fd)
+            # Wrap the write-end for convenient .write()
+            audio_write_pipe = os.fdopen(audio_write_fd, 'wb', buffering=0)
+            log.info("🔊 Audio pipe established.")
 
         log.info(f"📺 Streaming question #{question_num}...")
         try:
@@ -184,13 +210,14 @@ def stream_forever():
             transition_secs=2
         )
 
-        for frame_bytes in frame_gen:
+        for video_bytes, audio_bytes in frame_gen:
             if ffmpeg.poll() is not None:
                 log.warning("FFmpeg process died mid-stream.")
                 pipe_broken = True
                 break
             try:
-                ffmpeg.stdin.write(frame_bytes)
+                ffmpeg.stdin.write(video_bytes)
+                audio_write_pipe.write(audio_bytes)
             except (BrokenPipeError, IOError):
                 log.warning("FFmpeg pipe broken during frame write.")
                 pipe_broken = True
@@ -198,11 +225,9 @@ def stream_forever():
 
         if pipe_broken:
             log_ffmpeg_stderr(ffmpeg)
-            try:
-                if ffmpeg.stdin:
-                    ffmpeg.stdin.close()
-            except Exception:
-                pass
+            _close_pipe(ffmpeg.stdin, "ffmpeg.stdin")
+            _close_pipe(audio_write_pipe, "audio_write_pipe")
+            audio_write_pipe = None
             ffmpeg = None
             log.info("Sleeping 5 seconds before retrying stream loop...")
             time.sleep(5)

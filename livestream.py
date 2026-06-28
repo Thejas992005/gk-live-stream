@@ -72,7 +72,6 @@ def get_ffmpeg_process(ffmpeg_path):
     cmd = [
         ffmpeg_path,
         "-y",
-        "-re",  # Read input at native frame rate (real-time stream)
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
         "-pix_fmt", "rgb24",
@@ -185,22 +184,24 @@ def stream_forever():
             transition_secs=2
         )
 
+        start_time = time.time()
+        frame_idx = 0
         for frame_bytes in frame_gen:
-            t0 = time.time()
             if ffmpeg.poll() is not None:
                 log.warning("FFmpeg process died mid-stream.")
                 pipe_broken = True
                 break
             try:
                 ffmpeg.stdin.write(frame_bytes)
+                ffmpeg.stdin.flush()
             except (BrokenPipeError, IOError):
                 log.warning("FFmpeg pipe broken during frame write.")
                 pipe_broken = True
                 break
 
-            # Frame rate pacing to ensure smooth real-time streaming
-            elapsed = time.time() - t0
-            sleep_time = frame_duration - elapsed
+            frame_idx += 1
+            target_time = start_time + (frame_idx * frame_duration)
+            sleep_time = target_time - time.time()
             if sleep_time > 0:
                 time.sleep(sleep_time)
 

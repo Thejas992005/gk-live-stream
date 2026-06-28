@@ -117,9 +117,9 @@ def preload_next_question(q_queue):
                 qdata = generate_question()
                 frames = generate_question_frames(
                     qdata,
-                    question_secs=5,
+                    question_secs=12,
                     countdown_secs=5,
-                    answer_secs=3,
+                    answer_secs=5,
                     transition_secs=2
                 )
                 q_queue.put((qdata, frames))

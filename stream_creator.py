@@ -231,9 +231,9 @@ def make_transition_frame(t, total=1.0):
     return np.array(img)
 
 def generate_question_frames(qdata,
-                              question_secs=5,
+                              question_secs=12,
                               countdown_secs=5,
-                              answer_secs=3,
+                              answer_secs=5,
                               transition_secs=2):
     """
     Returns list of numpy frames for one complete question cycle.
